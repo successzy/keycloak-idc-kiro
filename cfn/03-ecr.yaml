@@ -1,0 +1,107 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Keycloak HA - ECR Stack (03/06)
+  Private ECR repository for custom Keycloak images (with IP-check SPI).
+  Image scanning on push; lifecycle policy keeps last N images.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [prod, staging, dev]
+
+  RepoName:
+    Type: String
+    Default: kc-keycloak
+    AllowedPattern: '^[a-z0-9][a-z0-9._-]*$'
+    Description: Short repo name. Final name will be ${Environment}/${RepoName}.
+
+  MaxImagesToKeep:
+    Type: Number
+    Default: 20
+    MinValue: 5
+    MaxValue: 100
+    Description: Number of most recent images to retain; older ones auto-deleted.
+
+  UntaggedImageDays:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    MaxValue: 30
+    Description: Untagged images (failed/abandoned builds) are purged after this many days.
+
+Resources:
+
+  Repository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RepositoryName: !Sub ${Environment}/${RepoName}
+      ImageTagMutability: IMMUTABLE
+      EmptyOnDelete: false
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      LifecyclePolicy:
+        LifecyclePolicyText: !Sub |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Expire untagged images after ${UntaggedImageDays} days",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": ${UntaggedImageDays}
+                },
+                "action": { "type": "expire" }
+              },
+              {
+                "rulePriority": 2,
+                "description": "Keep only the last ${MaxImagesToKeep} tagged images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": ${MaxImagesToKeep}
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+      RepositoryPolicyText:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowPullFromSameAccount
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action:
+              - ecr:GetDownloadUrlForLayer
+              - ecr:BatchGetImage
+              - ecr:BatchCheckLayerAvailability
+      Tags:
+        - Key: Name
+          Value: !Sub ${Environment}-kc-ecr
+        - Key: Environment
+          Value: !Ref Environment
+
+Outputs:
+
+  RepositoryUri:
+    Description: ECR repository URI for docker push/pull
+    Value: !GetAtt Repository.RepositoryUri
+    Export:
+      Name: !Sub ${Environment}-kc-ecr-RepositoryUri
+
+  RepositoryArn:
+    Value: !GetAtt Repository.Arn
+    Export:
+      Name: !Sub ${Environment}-kc-ecr-RepositoryArn
+
+  RepositoryName:
+    Value: !Ref Repository
+    Export:
+      Name: !Sub ${Environment}-kc-ecr-RepositoryName

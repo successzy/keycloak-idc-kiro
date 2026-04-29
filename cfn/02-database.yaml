@@ -1,0 +1,229 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Keycloak HA - Database Stack (02/06)
+  KMS CMK + Secrets Manager (DB credentials) + Aurora PostgreSQL cluster
+  (TEST MODE: single writer, no reader). Depends on 01-network.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [prod, staging, dev]
+
+  DbInstanceClass:
+    Type: String
+    Default: db.t4g.medium
+    AllowedValues:
+      - db.t4g.medium
+      - db.r6g.large
+      - db.r6g.xlarge
+      - db.r7g.large
+      - db.r7g.xlarge
+    Description: >
+      Aurora instance class. t4g.medium is burstable (2 vCPU/4GB, ~$48/mo/instance)
+      and suits low-to-moderate steady load. Upgrade to r6g.large for heavier usage.
+
+  EngineVersion:
+    Type: String
+    Default: '15.10'
+    Description: Aurora PostgreSQL engine version.
+
+  BackupRetentionDays:
+    Type: Number
+    Default: 30
+    MinValue: 7
+    MaxValue: 35
+
+  DbName:
+    Type: String
+    Default: keycloak
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9_]*$'
+
+  DbMasterUsername:
+    Type: String
+    Default: kcadmin
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9_]*$'
+    NoEcho: true
+
+Resources:
+
+  # ---------- KMS CMK (for Aurora + Secret) ----------
+  # TEST MODE: DeletionPolicy Delete (KMS enters 7-day pending deletion).
+  # Production should be Retain to guard against accidental data loss.
+  DbKmsKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Description: !Sub ${Environment} Keycloak - Aurora & Secret encryption key
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableRootAccount
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+          - Sid: AllowRdsService
+            Effect: Allow
+            Principal:
+              Service: rds.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+              - kms:CreateGrant
+            Resource: '*'
+          - Sid: AllowSecretsManagerService
+            Effect: Allow
+            Principal:
+              Service: secretsmanager.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub ${Environment}-kc-db-kms
+
+  DbKmsAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub alias/${Environment}-kc-db
+      TargetKeyId: !Ref DbKmsKey
+
+  # ---------- Secrets Manager (DB credentials) ----------
+  # TEST MODE: delete with stack. Production should Retain.
+  DbSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Name: !Sub ${Environment}/kc/db
+      Description: Keycloak Aurora master credentials
+      KmsKeyId: !Ref DbKmsKey
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username":"${DbMasterUsername}"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludeCharacters: '"@/\'
+      Tags:
+        - Key: Name
+          Value: !Sub ${Environment}-kc-db-secret
+
+  # ---------- Aurora PostgreSQL ----------
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub ${Environment} Keycloak DB subnet group
+      SubnetIds: !Split
+        - ','
+        - Fn::ImportValue: !Sub ${Environment}-kc-network-PrivateDbSubnetIds
+      Tags:
+        - Key: Name
+          Value: !Sub ${Environment}-kc-db-subnet-group
+
+  DbClusterParameterGroup:
+    Type: AWS::RDS::DBClusterParameterGroup
+    Properties:
+      Description: !Sub ${Environment} Keycloak Aurora PG 15 cluster params
+      Family: aurora-postgresql15
+      Parameters:
+        log_statement: ddl
+        log_min_duration_statement: '1000'
+
+  DbParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Description: !Sub ${Environment} Keycloak Aurora PG 15 instance params
+      Family: aurora-postgresql15
+      Parameters: {}
+
+  DbCluster:
+    Type: AWS::RDS::DBCluster
+    # TEST MODE: delete cluster (and data) on stack delete; no snapshot kept.
+    # Production should be Snapshot to retain a final backup.
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Engine: aurora-postgresql
+      EngineVersion: !Ref EngineVersion
+      DatabaseName: !Ref DbName
+      DBClusterIdentifier: !Sub ${Environment}-kc-aurora
+      MasterUsername: !Sub '{{resolve:secretsmanager:${DbSecret}:SecretString:username}}'
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${DbSecret}:SecretString:password}}'
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VpcSecurityGroupIds:
+        - Fn::ImportValue: !Sub ${Environment}-kc-network-DbSecurityGroupId
+      DBClusterParameterGroupName: !Ref DbClusterParameterGroup
+      StorageEncrypted: true
+      KmsKeyId: !GetAtt DbKmsKey.Arn
+      BackupRetentionPeriod: !Ref BackupRetentionDays
+      PreferredBackupWindow: '17:00-18:00'
+      PreferredMaintenanceWindow: 'sun:18:30-sun:19:30'
+      DeletionProtection: false
+      EnableCloudwatchLogsExports:
+        - postgresql
+      Tags:
+        - Key: Name
+          Value: !Sub ${Environment}-kc-aurora
+
+  # TEST MODE: only one instance. Production should add a second reader instance
+  # (PromotionTier: 1) across another AZ for automatic failover.
+  DbInstanceWriter:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub ${Environment}-kc-aurora-1
+      DBClusterIdentifier: !Ref DbCluster
+      Engine: aurora-postgresql
+      DBInstanceClass: !Ref DbInstanceClass
+      DBParameterGroupName: !Ref DbParameterGroup
+      PubliclyAccessible: false
+      AutoMinorVersionUpgrade: true
+      EnablePerformanceInsights: true
+      PerformanceInsightsKMSKeyId: !GetAtt DbKmsKey.Arn
+      PerformanceInsightsRetentionPeriod: 7
+      PromotionTier: 0
+      Tags:
+        - Key: Name
+          Value: !Sub ${Environment}-kc-aurora-1
+
+  # ---------- Secret-to-Cluster attachment ----------
+  DbSecretAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref DbSecret
+      TargetId: !Ref DbCluster
+      TargetType: AWS::RDS::DBCluster
+
+Outputs:
+
+  ClusterEndpoint:
+    Description: Aurora writer endpoint (use this from Keycloak)
+    Value: !GetAtt DbCluster.Endpoint.Address
+    Export:
+      Name: !Sub ${Environment}-kc-database-ClusterEndpoint
+
+  ClusterPort:
+    Value: !GetAtt DbCluster.Endpoint.Port
+    Export:
+      Name: !Sub ${Environment}-kc-database-ClusterPort
+
+  DbName:
+    Value: !Ref DbName
+    Export:
+      Name: !Sub ${Environment}-kc-database-DbName
+
+  SecretArn:
+    Description: Secrets Manager ARN for Aurora master credentials
+    Value: !Ref DbSecret
+    Export:
+      Name: !Sub ${Environment}-kc-database-SecretArn
+
+  KmsKeyArn:
+    Value: !GetAtt DbKmsKey.Arn
+    Export:
+      Name: !Sub ${Environment}-kc-database-KmsKeyArn
